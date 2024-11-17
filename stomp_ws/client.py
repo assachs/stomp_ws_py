@@ -1,9 +1,12 @@
 import time
+from operator import truediv
 from threading import Thread
 
 from .frame import Frame
 import websocket
 import logging
+import time
+import threading
 
 VERSIONS = '1.0,1.1'
 
@@ -18,6 +21,8 @@ class Client:
         self.ws.on_message = self._on_message
         self.ws.on_error = self._on_error
         self.ws.on_close = self._on_close
+        self.ws.on_ping = self._on_wsping
+        self.ws.on_pong = self._on_wspong
 
         self.opened = False
 
@@ -27,10 +32,28 @@ class Client:
         self.subscriptions = {}
 
         self._connectCallback = None
-        self.errorCallback = None
+        self._errorCallback = None
+
+        self.heartbeatsend = 5000
+        self.heartbeatreceived = 5000
+        self.heartbeatgrace = 3
+        self.heartbeatgracefirst = 3
+        self.hbfirst = True
+        self.lastreceived = 0
+        self.hbevent = None
+
+    def _on_wsping(self, ws, data):
+        print("WS Ping received and already answered")
+
+    def _on_wspong(self, ws, data):
+        # Outgoing ping received
+        print("WS Pong recieved on our ping")
 
     def _connect(self, timeout=0):
-        thread = Thread(target=self.ws.run_forever)
+        thread = Thread(target=self.ws.run_forever, kwargs={
+            "ping_interval": 10,
+            "ping_timeout": 3
+            })
         thread.daemon = True
         thread.start()
 
@@ -50,52 +73,122 @@ class Client:
         self._clean_up()
 
     def _on_error(self, ws_app, error, *args):
-        logging.debug(error)
+        print("error")
+        print(error)
+        if self._errorCallback is not None:
+            print("error callback")
+            self._errorCallback(error)
+        else:
+            print("error callback none")
+
+    def sendHeartbeat(self):
+        while True:
+            print(str(threading.get_ident()) + " send haeartbeat")
+            self.ws.send("\n")
+            time.sleep(self.hbsendinterval / 1000)
+
+    def scheduleHeartbeatReceived(self):
+        thread = Thread(target=self.checkHeartbeatReceived)
+        thread.daemon = True
+        thread.start()
+
+    def checkHeartbeatReceived(self):
+        while self.connected:
+            e = threading.Event()
+            self.hbevent = e
+
+            waittime = (self.receiveinterval * self.heartbeatgrace) / 1000
+            if self.hbfirst:
+                waittime = (self.receiveinterval * self.heartbeatgracefirst) / 1000
+                self.hbfirst = False
+            print("waittime" + str(waittime))
+            e.wait(waittime)
+            if (time.time() > waittime + self.lastreceived):
+                print(str(threading.get_ident()) + " HB timeout")
+                break
+            else:
+                print(str(threading.get_ident()) + " HB ok")
+
+        if self.connected:
+            self.scheduleHeartbeatReceived()
+
+    def initHeartbeat(self, frame):
+        hb = frame.headers['heart-beat']
+        sx, sy = hb.split(",")
+
+        self.hbsendinterval = max(int(sx), self.heartbeatsend)
+        print("set hbsendinterval to " + str(self.hbsendinterval))
+
+        thread = Thread(target=self.sendHeartbeat)
+        thread.daemon = True
+        thread.start()
+
+        self.receiveinterval = max(int(sy), self.heartbeatreceived)
+        self.lastreceived = time.time()
+        self.scheduleHeartbeatReceived()
+
+
 
     def _on_message(self, ws_app, message, *args):
+        print("OnMessage")
+        print(message)
         logging.debug("\n<<< " + str(message))
-        frame = Frame.unmarshall_single(message)
         _results = []
-        if frame.command == "CONNECTED":
-            self.connected = True
-            logging.debug("connected to server " + self.url)
-            if self._connectCallback is not None:
-                _results.append(self._connectCallback(frame))
-        elif frame.command == "MESSAGE":
 
-            subscription = frame.headers['subscription']
+        self.lastreceived = time.time()
+        if (self.hbevent is not None):
+            self.hbevent.set()
 
-            if subscription in self.subscriptions:
-                onreceive = self.subscriptions[subscription]
-                messageID = frame.headers['message-id']
+        if str(message) == "\n" :
+            print("stomp haertbeat recieved")
+            if self.pingCallback is not None:
+                self.pingCallback()
+            return
+        else:
+            frame = Frame.unmarshall_single(message)
 
-                def ack(headers):
-                    if headers is None:
-                        headers = {}
-                    return self.ack(messageID, subscription, headers)
+            if frame.command == "CONNECTED":
+                self.connected = True
+                logging.debug("connected to server " + self.url)
+                self.initHeartbeat(frame)
 
-                def nack(headers):
-                    if headers is None:
-                        headers = {}
-                    return self.nack(messageID, subscription, headers)
+                if self._connectCallback is not None:
+                    _results.append(self._connectCallback(frame))
+            elif frame.command == "MESSAGE":
 
-                frame.ack = ack
-                frame.nack = nack
+                subscription = frame.headers['subscription']
 
-                _results.append(onreceive(frame))
+                if subscription in self.subscriptions:
+                    onreceive = self.subscriptions[subscription]
+                    messageID = frame.headers['message-id']
+
+                    def ack(headers):
+                        if headers is None:
+                            headers = {}
+                        return self.ack(messageID, subscription, headers)
+
+                    def nack(headers):
+                        if headers is None:
+                            headers = {}
+                        return self.nack(messageID, subscription, headers)
+
+                    frame.ack = ack
+                    frame.nack = nack
+
+                    _results.append(onreceive(frame))
+                else:
+                    info = "Unhandled received MESSAGE: " + str(frame)
+                    logging.debug(info)
+                    _results.append(info)
+            elif frame.command == 'RECEIPT':
+                pass
+            elif frame.command == 'ERROR':
+                if self._errorCallback is not None:
+                    _results.append(self._errorCallback(frame))
             else:
-                info = "Unhandled received MESSAGE: " + str(frame)
+                info = "Unhandled received MESSAGE: " + frame.command
                 logging.debug(info)
                 _results.append(info)
-        elif frame.command == 'RECEIPT':
-            pass
-        elif frame.command == 'ERROR':
-            if self.errorCallback is not None:
-                _results.append(self.errorCallback(frame))
-        else:
-            info = "Unhandled received MESSAGE: " + frame.command
-            logging.debug(info)
-            _results.append(info)
 
         return _results
 
@@ -105,7 +198,10 @@ class Client:
         self.ws.send(out)
 
     def connect(self, login=None, passcode=None, headers=None, connectCallback=None, errorCallback=None,
-                timeout=0):
+                timeout=0, pingCallback=None):
+        self._connectCallback = connectCallback
+        self._errorCallback = errorCallback
+        self.pingCallback = pingCallback
 
         logging.debug("Opening web socket...")
         self._connect(timeout)
@@ -113,15 +209,12 @@ class Client:
         headers = headers if headers is not None else {}
         headers['host'] = self.url
         headers['accept-version'] = VERSIONS
-        headers['heart-beat'] = '10000,10000'
+        headers['heart-beat'] = str(self.heartbeatsend) + ',' + str(self.heartbeatreceived)
 
         if login is not None:
             headers['login'] = login
         if passcode is not None:
             headers['passcode'] = passcode
-
-        self._connectCallback = connectCallback
-        self.errorCallback = errorCallback
 
         self._transmit('CONNECT', headers)
 
